@@ -15,6 +15,7 @@ def getArgs():
 	parser = argparse.ArgumentParser(description="",version="1.0.0")
 	parser.add_argument('-b',dest="bamDir",type=str,required=True,help='BAM folder')
 	parser.add_argument('-p',dest="pluginDir",type=str,required=True,help='Path to IonNIPT folder')
+	parser.add_argument('-j',dest="nbJob",type=int,required=False,help='Number of jobs for parallelisation', default=24)
 	parser.add_argument('-o',dest="outDir",type=str,required=True,help='Output folder')
 	arg = parser.parse_args()
 	
@@ -26,40 +27,59 @@ def main(args):
 	bam_lst = []
 	for bam in os.listdir(args.bamDir):
 		if bam.endswith(".bam"):
+			if not os.path.exists(os.path.join(bam,".bai")):
+				sys.stdout.write("Bam files must be indexed")
+				sys.exit(1)
 			bam_lst.append(bam)
 			
 	### Make Wisecondor analysis (in //)
-	Parallel(n_jobs=80)(delayed(wisecondor)(bam, args.bamDir, args.outDir, args.pluginDir) for bam in bam_lst)
+	Parallel(n_jobs=args.nbJob)(delayed(wisecondor)(bam, args.bamDir, args.outDir, args.pluginDir) for bam in bam_lst)
+	
+	## Get smooth zscores
+	z_wisecondor = {}
+    	for bam in bam_lst:
+        	name = os.path.basename(bam).split('.')[0]
+        	z_wisecondor[name] = {}
+        	with open(os.path.join("%s"%args.outDir,"%s.tested"%name)) as file:
+            		data = pickle.loads(file.read())
+            		for chrom in ["13","18","21"]:
+                		zScores = data["zSmoothDict"][chrom]
+                		score   = -1
+                		try:
+                    			score = sum(zScores) / len(zScores)
+                		except:
+                    			score = -1
+                		z_wisecondor[name][chrom] = str(round(score,2))
 	
 	### Make Sanefalcon analysis
-
 	readstarts = os.path.join(args.outDir, 'readstarts')
 	os.makedirs(readstarts)
 	
 	## Get readstarts for each bam, in // per chromosome
+	nbJob = args.nbJob>=4 and args.nbJob/4 or 1
 	for bam in bam_lst:	
-		Parallel(n_jobs=23)(delayed(getReadStarts)(bam, id, args.bamDir, readstarts, args.pluginDir) for id in range(1,23))
+		Parallel(n_jobs=nbJob)(delayed(getReadStarts)(bam, id, args.bamDir, readstarts, args.pluginDir) for id in range(1,23))
 	
 	## Get nucleosome profiles
 	profiles = = os.path.join(args.outDir, 'profiles')
 	os.makedirs(profiles)
 	
-	Parallel(n_jobs=80)(delayed(getProfiles)(readstart, args.pluginDir, readstarts, profiles) for readstart in os.listdir(readstarts))
+	Parallel(n_jobs=args.nbJob)(delayed(getProfiles)(readstart, args.pluginDir, readstarts, profiles) for readstart in os.listdir(readstarts))
 			
 	## Get foetal fraction
 	
 	predict = os.path.join(args.pluginDir, 'sanefalcon/predict.sh')
 	trainModel = os.path.join(args.pluginDir, 'data/trainModel_BorBreCoc_defrag-rassf1.model')
 	
-	ff_sanefalcon
+	ff_sanefalcon = {}
 	for bam in bam_lst:
 		name = os.path.basename(bam).split('.')[0]
-		bam = os.path.join(profiles, bam)
+		bam = os.path.join(profiles, name)
 		
 		ff_cmd = "bash {predict} {trainModel} {bam}".format(predict=predict, trainModel=trainModel, bam=bam)
 		jobLauncher(ff_cmd)
 		
-		ff = open(os.path.join(bam + '.ff','r'))
+		ff = open(bam + '.ff','r')
 		for line in ff:
 			elem = line.split()
 			if elem[0] == 'Fetal':
@@ -69,7 +89,7 @@ def main(args):
 	
 	###
 	
-	defrag = os.path.join(args.plugin, 'wisecondor/defrag.py')
+	defrag = os.path.join(args.pluginDir, 'wisecondor/defrag.py')
 	male = os.path.join(args.pluginDir, 'data/male-defrag')
 	female = os.path.join(args.pluginDir, 'data/female-defrag')
 	sf = 0.688334125062
@@ -83,6 +103,24 @@ def main(args):
 	if p.returncode != 0:
 		raise Exception(stderr)
 
+	## Get FF
+	ff_defrag = {}
+    	ff = open(outfile,'r')
+    	for line in ff:
+        	elem = line.split()
+        	if elem[3] == "male" and elem[5] == "boys":
+            		ff_defrag[elem[0]] = [round(float(elem[1]), 2), "male"]
+        	elif elem[3] == "female" and elem[5] == "girls":
+            		ff_defrag[elem[0]] = [round(float(elem[1]), 2), "female"]
+        	else:
+			# TODO: take into account coverage on specific genes on ChrY
+            		ff_defrag[elem[0]] = [round(float(elem[1]), 2), "undetermined"]
+		
+	### Mimic InoNIPT plugin output on stdout
+	print "sample\tchrom21\tchrom18\tchrom13\tff defrag\tff sanefalcon\tsex"
+	for sample in ff_defrag.keys():
+        print "{sample}\t{chr21}\t{chr18}\t{chr13}\t{ffdefrag}\t{ffsanefalcon}\t{sex}".format(sample=sample, chr21=z_wisecondor[sample]["21"], chr18=z_wisecondor[sample]["18"], chr13=z_wisecondor[sample]["13"], ffdefrag=ff_defrag[sample][0], ffsanefalcon=ff_sanefalcon[sample], sex=ff_defrag[sample][1])
+	
 def wisecondor(bam, input, output, plugin):
 	
 	### exe + data
@@ -153,8 +191,8 @@ def getProfiles(readstart, plugin, input, output):
 	###
 	
 	if strand == 'fwd':
-		cmd_0 = "python {getProfile} {nuclTrak}/nuclTrack.{chr} {input}/{name}.{chr}.start.fwd 0 {output}/{name}.{chr}.fwd".format(getProfile=getProfile, nuclTrak=nuclTrak, chr=chr, name=name, input=input, output=output)
-		cmd_1 = "python {getProfile} {nuclTrak}/nuclTrack.{chr} {input}/{name}.{chr}.start.fwd 1 {output}/{name}.{chr}.ifwd".format(getProfile=getProfile, nuclTrak=nuclTrak, chr=chr, name=name, input=input, output=output)
+		cmd_0 = "python {getProfile} {nuclTrack}/nuclTrack.{chr} {input}/{name}.{chr}.start.fwd 0 {output}/{name}.{chr}.fwd".format(getProfile=getProfile, nuclTrack=nuclTrack, chr=chr, name=name, input=input, output=output)
+		cmd_1 = "python {getProfile} {nuclTrack}/nuclTrack.{chr} {input}/{name}.{chr}.start.fwd 1 {output}/{name}.{chr}.ifwd".format(getProfile=getProfile, nuclTrack=nuclTrack, chr=chr, name=name, input=input, output=output)
 		
 		jobLauncher(cmd_0)
 		jobLauncher(cmd_1)
